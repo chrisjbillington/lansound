@@ -49,26 +49,37 @@ class LANSoundServer(object):
 
     def set_latency(self, *args):
         if len(args) != 1:
-            return([b'error', b'wrong number of arguments'])
+            return([b'error', b'invalid number of arguments'])
         try:
             latency = int(args[0])
             assert latency >= 0
         except Exception:
             return([b'error', b'invalid value for latency'])
+        print('Client requested latency {}ms'.format(latency))
         if latency != self.latency:
             # Restart subprocess with new latency
-            print('Client requested latency %dms' % self.latency)
             self.latency = latency
             self.pipe.close()
             self.playback_process.terminate()
             self.playback_process.wait()
-            self.pipe = open(self.playback_fifo_filename, 'wb', 0)
             self.start_subprocess()
-        return([b'ok'])
+            self.pipe = open(self.playback_fifo_filename, 'wb', 0)
+        return [b'ok']
 
-    def process_command(self, command_name, *args):
-        if command_name == b'set_latency':
+    def say_hello(self, *args):
+        if args:
+            return([b'error', b'invalid number of arguments'])
+        else:
+            return [b'hello']
+
+    def process_command(self, command):
+        command_name, *args = command
+        if command_name == b'set-latency':
             return self.set_latency(*args)
+        elif command_name == b'hello':
+            return self.say_hello(*args)
+        else:
+            return [b'error', b'invalid command']
 
     def run(self):
         try:
@@ -76,16 +87,17 @@ class LANSoundServer(object):
                 self.start_subprocess()
                 self.pipe =  open(self.playback_fifo_filename, 'wb', 0)
                 while True:
-                    client_id, _, data, *command = self.sock.recv_multipart()
+                    messages = self.sock.recv_multipart()
+                    client_id, data, *command = messages
                     if data and not command:
                         # It's just audio data.
                         self.pipe.write(data)
                     elif command and not data:
                         # It's some other command:
                         response = self.process_command(command)
-                        self.sock.send_multipart([client_id, b''] + response)
-        except KeyboardInterrupt:
-            pass
+                        self.sock.send_multipart([client_id] + response)
+                    else:
+                        sys.stderr.write('ignoring invalid message\n')
         finally:
             # Cleanup
             try:
@@ -148,15 +160,17 @@ def main():
 
 if __name__ == '__main__':
     # Convert sigterm into a SystemExit exception:
-    def sigterm_handler(_signo, _stack_frame):
-        sys.stderr.write('Terminated\n')
+    def sigterm_handler(*args):
+        sys.stderr.write('terminated\n')
         raise SystemExit(0)
 
-    signal.signal(signal.SIGTERM, sigterm_handler)
+    signal.signal(signal.SIGTERM, lambda *args: sigterm_handler)
 
     try:
         main()
     except SystemExit as e:
         if e.code:
             sys.stderr.write('Run {} -h for help.\n'.format(sys.argv[0]))
-            raise
+        raise
+    except (KeyboardInterrupt, InterruptedError):
+        pass
