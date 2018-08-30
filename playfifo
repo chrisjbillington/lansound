@@ -1,0 +1,144 @@
+#!/usr/bin/env python3
+# Requires: python3-gst-1.0. Not obvious from error messages that dependency not satisfied.
+import sys
+import gi
+gi.require_version('Gst', '1.0')
+from gi.repository import Gst, GObject
+import argparse
+
+
+DEFAULT_LATENCY = 400 # milliseconds
+CD_DATA_RATE = 176400 # bytes per second
+
+
+class PlayFIFO(object):
+    def __init__(self, filename, latency, monitor):
+
+        self.n_underruns = 0
+
+        # Convert buffer duration to size in bytes:
+        self.buffer_size = int(latency * CD_DATA_RATE / 1000)
+
+        Gst.init(None)
+
+        # Create the pipeline for our elements.
+        self.pipeline = Gst.Pipeline()
+
+        # Create the elements for our project.
+        self.audio_source = Gst.ElementFactory.make('filesrc')
+        self.audio_source.set_property('location', filename)
+
+        self.queue = Gst.ElementFactory.make('queue')
+        self.queue.set_property('max-size-bytes', self.buffer_size)
+        # This means to discard old data on overrun. Ensures we don't play old
+        # audio in the case where we get behind and new audio is available:
+        self.queue.set_property('leaky', 2)
+        self.queue.connect('overrun', self.on_overrun)
+        self.queue.connect('underrun', self.on_underrun)
+
+        self.capsfilter = Gst.ElementFactory.make('capsfilter')
+        self.capsfilter.set_property("caps", Gst.Caps("audio/x-raw,format=S16LE,rate=44100,channels=2"))
+
+        self.audio_sink = Gst.ElementFactory.make('pulsesink')
+        self.audio_sink.set_property('buffer-time', 5000)
+
+        if monitor:
+            GObject.timeout_add(100, self.on_timeout)
+
+        # Add our elements to the pipeline.
+        self.pipeline.add(self.audio_source)
+        self.pipeline.add(self.queue)
+        self.pipeline.add(self.capsfilter)
+        self.pipeline.add(self.audio_sink)
+
+        # Link our elements together.
+        self.audio_source.link(self.queue)
+        self.queue.link(self.capsfilter)
+        self.capsfilter.link(self.audio_sink)
+
+        self.playing = False
+        self.pipeline.set_state(Gst.State.PAUSED)
+
+        bus = self.pipeline.get_bus()
+        bus.add_signal_watch()
+        bus.connect("message::error", self.on_gst_error)
+
+    def on_underrun(self, queue):
+        if self.playing:
+            self.playing = False
+            self.pipeline.set_state(Gst.State.PAUSED)
+            self.n_underruns += 1
+
+    def on_overrun(self, queue):
+        if not self.playing:
+            self.playing = True
+            self.pipeline.set_state(Gst.State.PLAYING)
+
+    def on_timeout(self):
+        if self.playing:
+            stream = sys.stdout
+        else:
+            stream = sys.stderr
+        buffer_level = self.queue.get_property('current-level-bytes')
+        percent = int(round(100*buffer_level/self.buffer_size))
+        hashes = int(percent/2)
+        dashes = 50 - hashes
+        stream.write('Buffer: [' + '#' * hashes + '-' * dashes + '] (%d underruns)\n' % self.n_underruns)
+        stream.flush()
+        return True
+
+    def on_gst_error(self, bus, message):
+        err, debug = message.parse_error()
+        sys.stderr.write("Gstreamer error: %s, %s, %s\n" % (err, debug, err.code))
+        sys.exit(1)
+
+    def shutdown(self):
+        self.pipeline.set_state(Gst.State.NULL)
+
+
+def main():
+    parser = argparse.ArgumentParser(description="""
+    Reads an input file or named pipe (FIFO) containing uncompressed CD
+    quality audio, and outputs it to the default pulseaudio sink.
+
+    Buffers playback with a configurable buffer. The use case is for when the
+    input FIFO is being filled by some stream, possibly from a network. The
+    buffering ensures smooth playback in the face of small interruptions to
+    the stream, at the cost of some latency.
+    """)
+
+    parser.add_argument('filename', type=str,
+                        help='The input file or named pipe (FIFO) to play. ' +
+                             'It must contain uncompressed CD quality audio, that is, ' +
+                             '16 bits per sample, 44100 samples per second, little ' +
+                             'endian PCM audio.')
+
+    parser.add_argument('-m', '--monitor', action='store_const', const=True, default=False,
+                        help='Print the buffer level and number of buffer ' +
+                             'underruns to the terminal, in order to visualise or ' +
+                             'monitor how stable the stream is.')
+
+    parser.add_argument('-l', '--latency', type=int, default=DEFAULT_LATENCY,
+                        help='The duration, in milliseconds, to buffer the input ' +
+                             'data before playing it. This increases latency, but ' +
+                             'also makes the audio less likely to cut out if ' +
+                             'there is a glitch in the input stream. ' +
+                             'The default is %dms, ' % DEFAULT_LATENCY +
+                             'which is appropriate for streaming over a local ' +
+                             'network.')
+
+
+    args = parser.parse_args()
+    app = PlayFIFO(args.filename, args.latency, args.monitor)
+    mainloop = GObject.MainLoop()
+    try:
+        mainloop.run()
+    except KeyboardInterrupt:
+        pass
+    finally:
+        app.shutdown()
+
+
+if __name__ == '__main__':
+    main()
+

@@ -1,0 +1,571 @@
+#!/usr/bin/env python3
+import os
+import sys
+import argparse
+from subprocess import Popen, check_output, check_call, CalledProcessError
+import socket
+import signal
+import select
+import time
+from termios import FIONREAD
+from fcntl import ioctl
+import ctypes
+import zmq
+
+os.chdir(os.path.dirname(os.path.realpath(__file__)))
+
+DEFAULT_SERVER_PORT = 57066
+DEFAULT_LATENCY = 400  # ms
+DEFAULT_IDLE_TIMEOUT = 5000 # ms
+
+CD_DATA_RATE = 176400 # bytes per second
+
+# Note: CHUNK_SIZE must be a multiple of four to ensure the PCM stream can't
+# go out of sync:
+CHUNK_SIZE = 8192
+CHUNK_DURATION_MS = int(1000*CHUNK_SIZE/CD_DATA_RATE) # ~46ms.
+
+# How long to wait for a response from server before considering it unresponsive:
+RESPONSE_TIMEOUT = 5000 # ms
+
+# How frequently to repeat any retrying of IP lookups, reconnections, etc:
+RECONNECTION_WAIT_TIME = 5000 #ms
+
+class NotConnectedToServer(Exception):
+    pass
+
+
+class NetworkingUtils(object):
+    """Collection of methods for finding servers and resolving hosts/IPs etc"""
+
+    @staticmethod
+    def decode_mdns(s):
+        """Decode the somewhat unique escape codes in the mDNS service name/host
+        etc for which there doesn't seem to be a stdlib function."""
+        # Substitution rules to make UTF encoded bytestring are:
+        #   \\ -> \
+        #   \. -> .
+        #   \xxx -> byte with decimal value xxx
+        out = b''
+        i = 0
+        while i < len(s):
+            if s[i] != '\\':
+                # normal char
+                out += s[i].encode()
+                i += 1
+            elif i < len(s) - 1 and s[i+1] in ['\\', '.']:
+                # escaped backslash or period:
+                out += s[i+1].encode()
+                i += 2
+            elif i < len(s) - 3 and s[i+1:i+4].isdigit():
+                # three digit escape code:
+                out += int(s[i+1:i+4]).to_bytes(1, 'little')
+                i += 4
+            else:
+                # backslash not part of an escape sequence:
+                out += s[i].encode()
+                i += 1
+        return out.decode('utf8')
+
+    @staticmethod
+    def find_servers(display=False, block=False):
+        """Call ahavi-browse to find lansound servers on the local network.
+        Parse them and return two lists, one of ipv4 servers and one of ipv6
+        servers."""
+        ipv4_servers = []
+        ipv6_servers = []
+        if display:
+            print('Finding lansound servers...')
+        while True:
+            output = check_output(['avahi-browse', '-rtpf', '_lansound._sub._zeromq._tcp']).decode('utf8')
+            for line in output.splitlines():
+                if line.startswith('='):
+                    _, interface, protocol, name, type_, domain, hostname, ip_address, port, _ = line.split(';')
+                    # Which of these are encoded this way? Don't know, but have
+                    # verified at least name and hostname can be when they contain
+                    # non-ascii chars. (though hostname doesn't appear to escape
+                    # periods). Replace escape codes in them all regardless:
+                    decoded = [NetworkingUtils.decode_mdns(s)
+                                   for s in (interface, protocol, name, type_, domain, hostname, ip_address, port)]
+                    interface, protocol, name, type_, domain, hostname, ip_address, port = decoded
+                    if protocol == 'IPv6':
+                        ip_address_bytes = socket.inet_pton(socket.AF_INET6, ip_address)
+                        if ip_address_bytes.startswith((0xfe80000000000000).to_bytes(8, 'big')):
+                            # Link local IPv6 address, append the interface to the address:
+                            ip_address += '%{}'.format(interface)
+                    server = [name, hostname, ip_address, int(port)]
+                    if protocol == 'IPv4':
+                        ipv4_servers.append(server)
+                    elif protocol == 'IPv6':
+                        ipv6_servers.append(server)
+                    else:
+                        raise ValueError('unrecognised protocol {}'.format(protocol))
+                    if display:
+                        print('{} - {}: hostname: {}, ip address: {}, port: {}'.format(
+                              protocol, name, hostname, ip_address, port))
+
+            if not (ipv4_servers or ipv6_servers):
+                if not block:
+                    print('None found.')
+                    break
+            else:
+                return ipv4_servers, ipv6_servers
+
+
+    def host_or_ip_to_ip(host_or_ip, ipv4=False, verbose=False):
+        """Get a hostname or an IP address and return the corresponding IP address."""
+        ipv6_err = None
+        ipv4_err = None
+
+        try:
+            # Is it an IPv6 address?
+            ip_bytes = socket.inet_pton(socket.AF_INET6, host_or_ip.split('%')[0]) # Strip interface from link-local IPs
+            if '%' in host_or_ip and not ip_bytes.startswith((0xfe80000000000000).to_bytes(8, 'big')):
+                sys.stderr.write('%<interface> given in non link local IPv6 address (not in fe80::/64)\n')
+                sys.exit(1)
+        except (OSError, socket.error):
+            pass
+        else:
+            if ipv4:
+                sys.stderr.write('{} appears to be an IPv6 address, '.format(host_or_ip) +
+                                 ' but the --ipv4 flag was set to force IPv4 only.\n')
+                sys.exit(1)
+            return host_or_ip
+        try:
+            # Is it an IPv4 address?
+            socket.inet_pton(socket.AF_INET, host_or_ip)
+            return host_or_ip
+        except (OSError, socket.error):
+            pass
+        if not ipv4:
+            try:
+                # Is it a hostname matching an IPv6 address?
+                info = socket.getaddrinfo(host_or_ip, None, socket.AF_INET6,
+                                                socket.SOCK_DGRAM, socket.IPPROTO_IP, socket.AI_CANONNAME)
+                ip_address = info[0][4][0]
+                ip_address = '[{}]'.format(ip_address)
+                return ip_address
+            except socket.gaierror as e:
+                ipv6_err = e
+        # Is it a hostname matching an IPv4 address?
+        try:
+            info = socket.getaddrinfo(host_or_ip, None, socket.AF_INET,
+                                            socket.SOCK_DGRAM, socket.IPPROTO_IP, socket.AI_CANONNAME)
+            ip_address = info[0][4][0]
+            return ip_address
+        except socket.gaierror as e:
+            ipv4_err = e
+
+        msg = 'No {}address found for hostname {}.\n'.format('ipv4 ' if ipv4 else '', host_or_ip)
+        if not ipv4:
+            msg += 'IPv6 lookup: {}\n'.format(ipv6_err)
+        msg += 'IPv4 lookup: {}\n'.format(ipv4_err)
+        if verbose:
+            sys.stderr.write(msg)
+        raise socket.gaierror(msg)
+
+
+# class EventMonitor(object):
+#     def __init__(self, monitor_port):
+#         self.monitor_port = monitor_port
+
+    # def setup(self):
+    #     # Connect to monitor port:
+    #     self.context = zmq.Context()
+    #     self.sock = self.context.socket(zmq.DEALER)
+    #     # Set the high water mark to about the response timeout worth of
+    #     # messages. If messages aren't sending after that long, then the
+    #     # connection has almost certainly gone down, and we should stop
+    #     # sending:
+    #     hwm = int(RESPONSE_TIMEOUT / CHUNK_DURATION_MS)
+    #     self.sock.setsockopt(zmq.SNDHWM, hwm)
+    #     self.sock.setsockopt(zmq.LINGER, 0)
+    #     self.sock.ipv6 = True
+    #     try:
+    #         socket.inet_pton(socket.AF_INET, ip_address)
+    #     except OSError:
+    #         # It's an IPv6 address, wrap it in square brackets:
+    #         endpoint_fmt = 'tcp://[{}]:{}'
+    #     else:
+    #         # No square brackets:
+    #         endpoint_fmt = 'tcp://{}:{}'
+    #     self.sock.connect(endpoint_fmt.format(ip_address, port))
+    #     self.connected = True
+    #     self.say_hello()
+    #     self.set_latency()
+    #     print('Connected successfully')
+
+
+class AudioInterceptor(object):
+    """Context manager to create a dummy Pulseaudio sink and capture its
+    output. Returns an open file object for reading raw audio data."""
+    def __init__(self, server_description, latency, idle_timeout, auto_enable, verbose):
+        self.latency = latency
+        self.idle_timeout = idle_timeout
+        self.auto_enable = auto_enable
+        self.verbose = verbose
+        pid = os.getpid()
+        self.fifo_filename = '/tmp/lansound.client.{}.fifo'.format(pid)
+        self.dummy_sink_name = 'lansound.dummy'
+        self.dummy_sink_description = 'lansound ({})'.format(server_description)
+        self.module_id = None
+        self.recording_process = None
+        self.pipe = None
+        self.poller = select.poll()
+        self.data_buffer = bytearray(CHUNK_SIZE)
+        # A memory view will give us writable slices, so that we can read into
+        # the buffer at a particular offset using file.readinto():
+        self.data_buffer_memview = memoryview(self.data_buffer)
+
+    def create_dummy_sink(self):
+        output = check_output(
+            ['pactl', 'load-module', 'module-null-sink',
+             'sink_name="{}"'.format(self.dummy_sink_name),
+             'sink_properties=device.description="{}"'.format(self.dummy_sink_description.replace(' ', '\ '))])
+        module_id = int(output.strip())
+        self.module_id = module_id
+        # Set latency offset, to counter for network delay, if supported
+        # by installed version of pulseaudio. This way videos will be
+        # delayed by the same amount and remain in sync with audio.
+        latency_us = int(1000*self.latency)
+        try:
+            check_call(['pactl', 'set-sink-latency-offset', self.dummy_sink_name, str(latency_us)])
+        except CalledProcessError:
+            sys.stderr.write('Warning: Could not call \'set-sink-latency-offset\' with pactl.\n' +
+                             'Audio will likely not be in sync with video.\n' +
+                             'This functionality requires PulseAudio 9.0 or newer.\n')
+
+    def switch_to_dummy_sink(self):
+        check_call(['./paswitch', self.dummy_sink_name])
+
+    def start_recording_subprocess(self):
+        cmd = ['./record2fifo',
+               '-i', str(self.idle_timeout),
+               '-s', '{}.monitor'.format(self.dummy_sink_name),
+               self.fifo_filename]
+        if self.verbose:
+            cmd.insert(1, '-v')
+        self.recording_process = Popen(cmd)
+
+    def setup(self):
+        self.create_dummy_sink()
+        if self.auto_enable:
+            self.switch_to_dummy_sink()
+        os.mkfifo(self.fifo_filename)
+        self.start_recording_subprocess()
+        self.pipe = open(self.fifo_filename,'rb', 0)
+        self.poller.register(self.pipe.fileno())
+
+    def read_chunk(self, timeout):
+        """read exactly CHUNK_SIZE bytes from the pipe and return a bytearray
+        of it, or return None if it takes longer than timeout (in
+        milliseconds). In case of timeout, discard partially read chunk."""
+        offset = 0
+        # Streaming data from the pipe to the zmq socket:
+        deadline = time.monotonic() + timeout/1000
+        if self.pipe is None:
+            raise RuntimeError("Audio redirecton not initialised")
+        while True:
+            data_pending = self.poller.poll((deadline - time.monotonic())*1000)
+            if not data_pending:
+                return None
+            # How much data is available to read?
+            offset += self.pipe.readinto(self.data_buffer_memview[offset:])
+            if offset == CHUNK_SIZE:
+                return self.data_buffer
+
+    def cleanup(self):
+        try:
+            self.pipe.close()
+        except Exception:
+            pass
+        try:
+            self.recording_process.terminate()
+        except Exception:
+            pass
+        try:
+            os.unlink(self.fifo_filename)
+        except Exception:
+            pass
+        try:
+            check_call(['pactl', 'unload-module', str(self.module_id)])
+        except Exception:
+            pass
+
+    def __enter__(self):
+        try:
+            self.setup()
+        except:
+            self.cleanup()
+            raise
+
+    def __exit__(self, *args):
+        self.cleanup()
+
+
+class ServerConnection(object):
+    """Context manager to find a server and connect to it, based on user
+    settings. If specified server cannot be connected to no servers are found,
+    blocks until it can connect to one."""
+    def __init__(self, host, port, latency, ipv4, verbose):
+        self.host = host
+        self.port = port
+        self.latency = latency
+        self.ipv4 = ipv4
+        self.verbose = verbose
+        self.context = None
+        self.sock = None
+        self.connected = False
+
+    def _check_connected(self):
+        if not self.connected:
+            raise RuntimeError('Method not permitted outside connection context')
+
+    def send(self, data):
+        """Send data as single part message. Don't wait for response. Don't
+        block, raise NotConnectedToServer if HWM is reached."""
+        self._check_connected()
+        try:
+            self.sock.send(data, zmq.NOBLOCK)
+        except zmq.Again:
+            raise NotConnectedToServer('HWM reached')
+
+    def sendrecv(self, multipart_to_send, multipart_expected_response):
+        """Send data as multipart message. Don't block, raise
+        NotConnectedToServer if HWM is reached. Wait for response, raise
+        NotConnectedToServer if no response within timeout."""
+        self._check_connected()
+        try:
+            self.sock.send_multipart(multipart_to_send, zmq.NOBLOCK)
+        except zmq.Again:
+            raise NotConnectedToServer('HWM reached')
+        events = self.sock.poll(RESPONSE_TIMEOUT)
+        if events:
+            response = self.sock.recv_multipart()
+            if not response == multipart_expected_response:
+                raise Exception('Unexpected response from server:\n{}\n'.format(response))
+        else:
+            raise NotConnectedToServer("Server didn't respond within timeout")
+
+    def say_hello(self):
+        self.sendrecv([b'', b'hello'], [b'hello'])
+
+    def set_latency(self):
+        self.sendrecv([b'', b'set-latency', str(self.latency).encode()], [b'ok'])
+
+    def connect(self, ip_address, port):
+        # Connect to server:
+        self.context = zmq.Context()
+        self.sock = self.context.socket(zmq.DEALER)
+        # Set the high water mark to about the response timeout worth of
+        # messages. If messages aren't sending after that long, then the
+        # connection has almost certainly gone down, and we should stop
+        # sending:
+        hwm = int(RESPONSE_TIMEOUT / CHUNK_DURATION_MS)
+        self.sock.setsockopt(zmq.SNDHWM, hwm)
+        self.sock.setsockopt(zmq.LINGER, 0)
+        self.sock.ipv6 = True
+        try:
+            socket.inet_pton(socket.AF_INET, ip_address)
+        except OSError:
+            # It's an IPv6 address, wrap it in square brackets:
+            endpoint_fmt = 'tcp://[{}]:{}'
+        else:
+            # No square brackets:
+            endpoint_fmt = 'tcp://{}:{}'
+        self.sock.connect(endpoint_fmt.format(ip_address, port))
+        self.connected = True
+        self.say_hello()
+        self.set_latency()
+        print('Connected successfully')
+
+    def setup(self):
+        """Connect to specified server, or any server if none given. Block
+        until we can connect, waiting for servers to appear if necessary."""
+        if self.host is not None:
+            # User has specified a specific host, so keep trying to connect to
+            # it indefinitely:
+            print('Attempting to connect to lansound server on {}, port {}'.format(self.host, self.port))
+            while True:
+                try:
+                    ip_address = NetworkingUtils.host_or_ip_to_ip(self.host, self.ipv4)
+                except socket.gaierror as e:
+                    sys.stderr.write(str(e) + '\n')
+                    time.sleep(RECONNECTION_WAIT_TIME/1000)
+                    continue
+                try:
+                    self.connect(ip_address, self.port)
+                except NotConnectedToServer as e:
+                    sys.stderr.write(str(e) + '\n')
+                    time.sleep((RECONNECTION_WAIT_TIME - RESPONSE_TIMEOUT)/1000)
+                    continue
+                break
+        else:
+            # Search for servers. If there are none, wait until there are.
+            # Connect to the first one we can.
+            while True:
+                ipv4_servers, ipv6_servers = NetworkingUtils.find_servers(display=self.verbose, block=True)
+                if self.ipv4:
+                    servers = ipv4_servers
+                    if not servers:
+                        sys.stderr.write('--ipv4 option set, but only IPv6 server(s) found on network. Retrying.\n')
+                        time.sleep(RECONNECTION_WAIT_TIME/1000)
+                        continue
+                else:
+                    servers = ipv6_servers + ipv4_servers
+                # We found servers. Try to connect to them.
+                for server in servers:
+                    name, hostname, ip_address, port = server
+                    print('Attempting to connect to lansound server on {}:{} ({}:{})'.format(
+                          hostname, port, ip_address, port))
+                    try:
+                        self.connect(ip_address, port)
+                    except NotConnectedToServer as e:
+                        sys.stderr.write(str(e) + '\n')
+                        continue
+                    break
+                else:
+                    # We tried all the servers and couldn't connect to any.
+                    # Back to searching for servers:
+                    time.sleep(RECONNECTION_WAIT_TIME/1000)
+                    continue
+                break
+
+    def cleanup(self):
+        self.connected = False
+        try:
+            self.sock.close()
+            self.context.term()
+        except Exception:
+            pass
+
+    def __enter__(self):
+        try:
+            self.setup()
+        except:
+            self.cleanup()
+            raise
+
+    def __exit__(self, *args):
+        self.cleanup()
+
+
+class LansoundClient(object):
+    def __init__(self, host, port, latency, idle_timeout, auto_enable, ipv4, monitor_port, verbose):
+        self.host = host
+        self.port = port
+        self.latency = latency
+        self.idle_timeout = idle_timeout
+        self.auto_enable = auto_enable
+        self.ipv4 = ipv4
+        self.monitor_port = monitor_port
+        self.verbose = verbose
+        if host is None:
+            self.server_description = "any server"
+        else:
+            self.server_description = '{}:{}'.format(host, port)
+
+    def run(self):
+        # event_monitor = EventMonitor(self.monitor_port)
+        audio_interceptor = AudioInterceptor(
+            self.server_description, self.latency, self.idle_timeout, self.auto_enable, self.verbose)
+        server_connection = ServerConnection(self.host, self.port, self.latency, self.ipv4, self.verbose)
+        with audio_interceptor:
+            while True:
+                with server_connection:
+                    # poller.register(pipe.fileno())
+                    try:
+                        # Streaming data from the pipe to the zmq socket:
+                        while True:
+                            chunk = audio_interceptor.read_chunk(RESPONSE_TIMEOUT)
+                            if chunk is not None:
+                                server_connection.send(chunk)
+                            else:
+                                # Audio capture has paused. Spend the time
+                                # pinging server to confirm connection still
+                                # up:
+                                server_connection.say_hello()
+                    except NotConnectedToServer:
+                        sys.stderr.write('Connection to server lost.\n')
+                        continue
+
+
+def main():
+
+    parser = argparse.ArgumentParser(description="""
+    Streams all your computer's audio output to a server running lansound-server.
+    """)
+
+    parser.add_argument('--list', action='store_const', const=True, default=False,
+                        help='List all lansound servers on the network and exit.\n')
+
+    parser.add_argument('-H', '--host', type=str, default=None,
+                        help='The hostname or IP address of the lansound-server to connect to. ' +
+                             'If not given, the first server found on the local network ' +
+                             'will be used.')
+
+    parser.add_argument('-p', '--port', type=int, default=DEFAULT_SERVER_PORT,
+                        help='If --server is given, the port to connect to. Defaults to {}.'.format(DEFAULT_SERVER_PORT))
+
+    parser.add_argument('-l', '--latency', type=int, default=DEFAULT_LATENCY,
+                        help='The duration, in milliseconds, to buffer the input ' +
+                             'data before playing it on the server. This increases latency, but ' +
+                             'also makes the audio less likely to cut out if ' +
+                             'there is a glitch in the network. ' +
+                             'The default is %dms, ' % DEFAULT_LATENCY +
+                             'which is appropriate for streaming over a local ' +
+                             'network.')
+
+    parser.add_argument('-i', '--idle-timeout', type=int, default=DEFAULT_IDLE_TIMEOUT,
+                        help='How long in milliseconds to wait after audio stops playing before pausing ' +
+                             'transmission of data to the server. This is useful for ' +
+                             'conserving battery, CPU and bandwidth when there is no audio. ' +
+                             'Defaults to {}ms.'.format(DEFAULT_IDLE_TIMEOUT))
+
+    parser.add_argument('-n', '--no-auto-enable', dest='auto_enable', action='store_const', const=False, default=True,
+                        help='Do not automatically switch to the PulseAudio sink that lansound creates. ' +
+                             'Audio output will continue from whatever device is currently selected ' +
+                             'until the user selects the lansound sink as their default PulseAudio sink ' +
+                             'in gnome sound settings or equivalent. Or, if using a more advanced tool ' +
+                             'such as pavucontrol, the user can direct, for example, only one application\'s ' +
+                             'output to lansound.')
+
+    parser.add_argument('-4', '--ipv4', action='store_const', const=True, default=False,
+                        help='Only use IPv4 when choosing a server or looking up given hostname. ' +
+                             'Otherwise, IPv6 is preferred.')
+
+    parser.add_argument('-m', '--monitor-port', type=int,
+                        help='A port number, to which a ZeroMQ PULL socket is bound (on localhost), which '
+                             'lansound should send events to. This is for monitoring lansound\'s status, '
+                             'and is used for example by indicator-lansound to display an icon and other information.')
+
+    parser.add_argument('-v', '--verbose', dest='verbose', action='store_const', const=True, default=False,
+                        help='Print debug information.')
+
+    args = parser.parse_args()
+
+    if args.list:
+        NetworkingUtils.find_servers(display=True)
+        sys.exit(0)
+
+    app = LansoundClient(args.host, args.port, args.latency, args.idle_timeout,
+        args.auto_enable, args.ipv4, args.monitor_port, args.verbose)
+    app.run()
+
+if __name__ == '__main__':
+    # Convert sigterm into a SystemExit exception:
+    def sigterm_handler(_signo, _stack_frame):
+        sys.stderr.write('Terminated\n')
+        raise SystemExit(0)
+
+    signal.signal(signal.SIGTERM, sigterm_handler)
+
+    print(os.getpid())
+    try:
+        main()
+    except SystemExit as e:
+        if e.code:
+            sys.stderr.write('Run {} -h for help.\n'.format(sys.argv[0]))
+        raise
+    except (KeyboardInterrupt, InterruptedError):
+        pass

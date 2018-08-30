@@ -1,0 +1,162 @@
+#!/usr/bin/env python3
+import os
+import sys
+import argparse
+from subprocess import Popen, check_call, PIPE
+import signal
+import zmq
+
+os.chdir(os.path.dirname(os.path.realpath(__file__)))
+
+DEFAULT_PORT = 57066
+DEFAULT_LATENCY = 400 # ms
+DEFAULT_SERVER_NAME = 'lansound server'
+
+
+class LANSoundServer(object):
+    def __init__(self, name, port, latency, monitor):
+        self.monitor = monitor
+        pid = os.getpid()
+        self.playback_fifo_filename = '/tmp/lansound.server.{}.fifo'.format(pid)
+
+        # Set output of default sink to 100% - volume is to be controlled client side, not here:
+        check_call(['pactl', 'set-sink-volume', '@DEFAULT_SINK@', '100%'])
+
+        # Start listening on the given port:
+        self.context = zmq.Context()
+        self.sock = self.context.socket(zmq.ROUTER)
+        self.sock.setsockopt(zmq.LINGER, 0)
+        self.sock.ipv6 = True
+        self.sock.bind('tcp://*:%s' % str(port))
+
+        # Register a DNS-SD entry for our service, so clients can find us:
+        self.avahi_process = Popen(['avahi-publish-service',
+                                   '--subtype=_lansound._sub._zeromq._tcp',
+                                    name,  "_zeromq._tcp", str(port)], stderr=PIPE)
+        avahi_output = self.avahi_process.stderr.readline().decode()
+        sys.stdout.write(avahi_output)
+        if not "Established" in avahi_output:
+            raise RuntimeError('Could not publish service')
+
+        os.mkfifo(self.playback_fifo_filename)
+        self.latency = latency
+
+    def start_subprocess(self):
+        cmd = ['./playfifo', '-l', str(self.latency), self.playback_fifo_filename]
+        if self.monitor:
+            cmd.insert(1, '-m')
+        self.playback_process = Popen(cmd)
+
+    def set_latency(self, *args):
+        if len(args) != 1:
+            return([b'error', b'wrong number of arguments'])
+        try:
+            latency = int(args[0])
+            assert latency >= 0
+        except Exception:
+            return([b'error', b'invalid value for latency'])
+        if latency != self.latency:
+            # Restart subprocess with new latency
+            print('Client requested latency %dms' % self.latency)
+            self.latency = latency
+            self.pipe.close()
+            self.playback_process.terminate()
+            self.playback_process.wait()
+            self.pipe = open(self.playback_fifo_filename, 'wb', 0)
+            self.start_subprocess()
+        return([b'ok'])
+
+    def process_command(self, command_name, *args):
+        if command_name == b'set_latency':
+            return self.set_latency(*args)
+
+    def run(self):
+        try:
+            while True:
+                self.start_subprocess()
+                self.pipe =  open(self.playback_fifo_filename, 'wb', 0)
+                while True:
+                    client_id, _, data, *command = self.sock.recv_multipart()
+                    if data and not command:
+                        # It's just audio data.
+                        self.pipe.write(data)
+                    elif command and not data:
+                        # It's some other command:
+                        response = self.process_command(command)
+                        self.sock.send_multipart([client_id, b''] + response)
+        except KeyboardInterrupt:
+            pass
+        finally:
+            # Cleanup
+            try:
+                self.pipe.close()
+            except Exception: pass
+            try:
+                self.avahi_process.terminate()
+            except Exception: pass
+            try:
+                self.playback_process.terminate()
+            except Exception: pass
+            try:
+                os.unlink(self.playback_fifo_filename)
+            except Exception:
+                pass
+            try:
+                self.sock.close()
+                self.context.term()
+            except Exception:
+                pass
+
+
+def main():
+
+    parser = argparse.ArgumentParser(description="""
+    Server for lansound. Listens on a ZMQ socket for uncompressed CD
+    quality audio, and outputs it to the default pulseaudio sink.
+
+    Buffers playback with a configurable buffer, to ensure smooth playback in
+    the face of small interruptions to the stream, at the cost of some
+    latency. """)
+
+    parser.add_argument('-n', '--name', type=str, default=DEFAULT_SERVER_NAME,
+                        help='The name to give the server. This is how it will ' +
+                        'appear to clients on the network. Default: \'%s\'' % DEFAULT_SERVER_NAME)
+
+    parser.add_argument('-p', '--port', type=int, default=DEFAULT_PORT,
+                        help='The port to listen on. Default: %d' % DEFAULT_PORT)
+
+    parser.add_argument('-m', '--monitor', action='store_const', const=True, default=False,
+                        help='Print the buffer level and number of buffer ' +
+                             'underruns to the terminal, in order to visualise or ' +
+                             'monitor how stable the stream is.')
+
+    parser.add_argument('-l', '--default-latency', dest='latency', type=int, default=DEFAULT_LATENCY,
+                        help='The default duration, in milliseconds, to buffer the input ' +
+                             'data before playing it. This increases latency, but ' +
+                             'also makes the audio less likely to cut out if ' +
+                             'there is a glitch in the input stream. ' +
+                             'The default is %dms, ' % DEFAULT_LATENCY +
+                             'which is appropriate for streaming over a local ' +
+                             'network. Clients can change this, the value set ' +
+                             'here is only the default, used until one is set by a client')
+
+
+    args = parser.parse_args()
+
+    app = LANSoundServer(args.name, args.port, args.latency, args.monitor)
+    app.run()
+
+if __name__ == '__main__':
+    # Convert sigterm into a SystemExit exception:
+    def sigterm_handler(_signo, _stack_frame):
+        sys.stderr.write('Terminated\n')
+        raise SystemExit(0)
+
+    signal.signal(signal.SIGTERM, sigterm_handler)
+
+    try:
+        main()
+    except SystemExit as e:
+        if e.code:
+            sys.stderr.write('Run {} -h for help.\n'.format(sys.argv[0]))
+            raise

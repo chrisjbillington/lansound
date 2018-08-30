@@ -1,0 +1,169 @@
+#!/usr/bin/env python3
+# Requires: python3-gst-1.0. Not obvious from error messages that dependency not satisfied.
+import sys
+import threading
+from subprocess import Popen, check_output, PIPE
+import gi
+gi.require_version('Gst', '1.0')
+from gi.repository import Gst, GObject
+import argparse
+
+
+class RecordFIFO(object):
+    def __init__(self, idle_timeout, sourcename, filename, verbose):
+
+        self.idle_timeout = idle_timeout
+        self.verbose = verbose
+
+        Gst.init(None)
+
+        # Create the pipeline for our elements.
+        self.pipeline = Gst.Pipeline()
+
+        # Create the elements for our project.
+        self.audio_source = Gst.ElementFactory.make('pulsesrc')
+        self.audio_source.set_property('device', sourcename)
+
+        self.audio_sink = Gst.ElementFactory.make('filesink')
+        self.audio_sink.set_property('location', filename)
+
+        # Add our elements to the pipeline.
+        self.pipeline.add(self.audio_source)
+        self.pipeline.add(self.audio_sink)
+
+        # Link our elements together.
+        self.audio_source.link(self.audio_sink)
+
+        bus = self.pipeline.get_bus()
+        bus.add_signal_watch()
+        bus.connect("message::error", self.on_gst_error)
+
+        if self.idle_timeout is not None:
+            if not sourcename.endswith('.monitor'):
+                sys.stderr.write('Autopause can only be used with a .monitor source.\n')
+                sys.exit(1)
+            self.monitored_sink = ''.join(sourcename.split('.monitor')[:-1])
+            self.autopause_thread = threading.Thread(target=self.autopause_loop)
+            self.autopause_thread.deamon = True
+            self.playing = False
+            if self.verbose: print('Waiting for output file to become writable...')
+            self.pipeline.set_state(Gst.State.PAUSED)
+            if self.verbose: print('Stream is writable, audio capture paused.')
+            self.autopause_thread.start()
+        else:
+            self.playing = True
+            if self.verbose: print('Waiting for output file to become writable...')
+            self.pipeline.set_state(Gst.State.PLAYING)
+            if self.verbose: print('Stream is writable, audio capture running.')
+
+    def on_gst_error(self, bus, message):
+        err, debug = message.parse_error()
+        sys.stderr.write("Gstreamer error: %s, %s, %s\n" % (err, debug, err.code))
+        sys.exit(1)
+
+    def get_sink_status(self, return_sink_number=False):
+        output = check_output(['pactl', 'list', 'sinks']).decode('utf8')
+        for line in output.splitlines():
+            if line.strip().startswith('Sink #'):
+                sink_number = int(line.split()[1][1:])
+            if line.strip().startswith('State'):
+                state = line.split()[1]
+            if line.strip().startswith('Name') and line.split()[1] == self.monitored_sink:
+                if return_sink_number:
+                    return state, sink_number
+                else:
+                    return state
+        else:
+            raise ValueError('Sink {} not present in "pactl list sinks"'.format(self.monitored_sink))
+
+    def pause(self):
+        self.playing = False
+        if self.verbose: print('Audio capture paused.')
+        self.pipeline.set_state(Gst.State.PAUSED)
+        self.pause_timeout_id = None
+
+    def play(self):
+        self.playing=True
+        self.pipeline.set_state(Gst.State.PLAYING)
+        if self.verbose: print('Audio capture resumed.')
+        self.resume_timeout_id = None
+
+    def autopause_loop(self):
+        self.pactl_subscribe = Popen(['pactl', 'subscribe'], stdout=PIPE, universal_newlines=True)
+        state, sink_number = self.get_sink_status(return_sink_number=True)
+        if state == 'RUNNING':
+            if self.verbose: print('Sink running, resuming audio capture...')
+            self.resume_timeout_id = GObject.idle_add(self.play)
+        else:
+            self.resume_timeout_id = None
+        interesting_event = "Event 'change' on sink #{}".format(sink_number)
+        self.pause_timeout_id = None
+        while True:
+            line = self.pactl_subscribe.stdout.readline()
+            if not line:
+                break
+            if line.strip() == interesting_event:
+                if self.get_sink_status() == 'RUNNING':
+                    if self.pause_timeout_id is not None:
+                        GObject.source_remove(self.pause_timeout_id)
+                        self.pause_timeout_id = None
+                        if self.verbose: print('Sink running, pause cancelled.')
+                    if not self.playing and self.resume_timeout_id is None:
+                        if self.verbose: print('Sink running, resuming audio capture...')
+                        self.resume_timeout_id = GObject.idle_add(self.play)
+                else:
+                    if self.resume_timeout_id is not None:
+                        GObject.source_remove(self.resume_timeout_id)
+                        self.resume_timeout_id = None
+                        if self.verbose: print('Resume cancelled.')
+                    if self.playing and self.pause_timeout_id is None:
+                        if self.verbose: print('Sink idle. Audio capture will pause in {} milliseconds...'.format(
+                                               self.idle_timeout))
+                        # Pause idle_timeout milliseconds from now if it's still not running then:
+                        self.pause_timeout_id = GObject.timeout_add(self.idle_timeout, self.pause)
+
+    def shutdown(self):
+        self.pipeline.set_state(Gst.State.NULL)
+        if hasattr(self, 'pactl_subscribe'):
+            self.pactl_subscribe.terminate()
+
+
+def main():
+    parser = argparse.ArgumentParser(description="""
+    Reads from a pulseaudio source and writes uncompressed CD
+    quality audio to a file, possibly a named pipe (FIFO).
+    """)
+
+    parser.add_argument('-i', '--idle-timeout', type=int, default=None,
+                        help='If recording from a .monitor source, pause recording if the '
+                             'corresponding sink becomes idle for this many milliseconds. '
+                             'This is useful for conserving battery and CPU ' +
+                             'when there is no audio, but should not be used if a faithful recoding of the sound, '
+                             'including silences, is desired.')
+
+    parser.add_argument('-s', '--source', type=str, default=None,
+                        help='The pulseaudo source to record from. If not given, uses the default source.')
+
+    parser.add_argument('filename', type=str,
+                        help='The input file or named pipe (FIFO) to write to. ' +
+                             'Uncompressed CD quality audio will be written to this file, that is, ' +
+                             '16 bits per sample, 44100 samples per second, little ' +
+                             'endian PCM audio.')
+
+    parser.add_argument('-v', '--verbose', dest='verbose', action='store_const', const=True, default=False,
+                        help='Print info about when the stream is being paused and resumed')
+
+    args = parser.parse_args()
+    app = RecordFIFO(args.idle_timeout, args.source, args.filename, args.verbose)
+    mainloop = GObject.MainLoop()
+    try:
+        mainloop.run()
+    except KeyboardInterrupt:
+        pass
+    finally:
+        app.shutdown()
+
+
+if __name__ == '__main__':
+    main()
+
