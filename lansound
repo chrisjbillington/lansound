@@ -560,7 +560,7 @@ if __name__ == '__main__':
 
     signal.signal(signal.SIGTERM, sigterm_handler)
 
-    print(os.getpid())
+    # print(os.getpid())
     try:
         main()
     except SystemExit as e:
