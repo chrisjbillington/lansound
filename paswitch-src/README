@@ -1,0 +1,62 @@
+paswitch is a simple commandline utility for changing the PulseAudio sink for
+all applications, in much the same way GNOME "Sound preferences" dialog
+does it.
+
+"pacmd set-default-sink" alone is not sufficient since PulseAudio daemon
+keeps persistant settings for applications and this default only gets used
+for applications that the daemon have not yet seen.
+
+
+
+Compiling
+=========
+
+To compile:
+
+ $ make
+
+You need "libpulse-dev" installed.
+
+If your system stores headers and/or libraries in an unusual place you
+might need to adjust the gcc command line in the Makefile.
+
+
+
+Using
+=====
+
+To get a list of sinks on your system:
+
+ $ pactl list
+
+Look for lines that look like this:
+
+Sink #0
+        State: SUSPENDED
+        Name: alsa_output.pci-0000_01_00.1.hdmi-stereo
+	      ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+You need to supply this name to paswitch:
+
+ $ paswitch alsa_output.pci-0000_01_00.1.hdmi-stereo
+
+
+
+License
+=======
+
+paswitch, PulseAudio commandline sink switcher
+Copyright (C) 2012  Tomaz Solc <tomaz.solc@tablix.org>
+
+This program is free software: you can redistribute it and/or modify
+it under the terms of the GNU General Public License as published by
+the Free Software Foundation, either version 3 of the License, or
+(at your option) any later version.
+
+This program is distributed in the hope that it will be useful,
+but WITHOUT ANY WARRANTY; without even the implied warranty of
+MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+GNU General Public License for more details.
+
+You should have received a copy of the GNU General Public License
+along with this program.  If not, see <http://www.gnu.org/licenses/>.
