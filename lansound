@@ -228,12 +228,13 @@ class AudioInterceptor(object):
         # by installed version of pulseaudio. This way videos will be
         # delayed by the same amount and remain in sync with audio.
         latency_us = int(1000*self.latency)
-        try:
-            check_call(['pactl', 'set-sink-latency-offset', self.dummy_sink_name, str(latency_us)])
-        except CalledProcessError:
-            sys.stderr.write('Warning: Could not call \'set-sink-latency-offset\' with pactl.\n' +
-                             'Audio will likely not be in sync with video.\n' +
-                             'This functionality requires PulseAudio 9.0 or newer.\n')
+        # TODO: get this working one day
+        # try:
+        #     check_call(['pactl', 'set-sink-latency-offset', self.dummy_sink_name, str(latency_us)])
+        # except CalledProcessError:
+        #     sys.stderr.write('Warning: Could not call \'set-sink-latency-offset\' with pactl.\n' +
+        #                      'Audio will likely not be in sync with video.\n' +
+        #                      'This functionality requires PulseAudio 9.0 or newer.\n')
 
     def switch_to_dummy_sink(self):
         check_call(['./paswitch', self.dummy_sink_name])
