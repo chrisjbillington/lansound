@@ -9,10 +9,11 @@ to the parent directory.
 On both the client and server you will need pyzmq, gstreamer, and the
 gobject-introspection Python bindings for gstreamer and glib.
 
-Run `./lasound-server` on the server, and `./lansound` on the client. Supported
-arguments on the client are:
+Run `./lasound-server` on the server, and `./lansound` on the client.
 
-Possible client command line options are:
+
+Client command line options are:
+
 ```
 $ ./lansound -h
 usage: lansound [-h] [--list] [-H HOST] [-p PORT] [-l LATENCY]
@@ -54,7 +55,7 @@ optional arguments:
 ```
 
 
-Possible server command line options are:
+Server command line options are:
 
 ```
 $ ./lansound-server -h
