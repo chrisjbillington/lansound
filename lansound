@@ -22,8 +22,8 @@ CD_DATA_RATE = 176400 # bytes per second
 
 # Note: CHUNK_SIZE must be a multiple of four to ensure the PCM stream can't
 # go out of sync:
-CHUNK_SIZE = 8192
-CHUNK_DURATION_MS = int(1000*CHUNK_SIZE/CD_DATA_RATE) # ~46ms.
+CHUNK_SIZE = 1024
+CHUNK_DURATION_MS = 1000 * CHUNK_SIZE / CD_DATA_RATE  # ~6ms.
 
 # How long to wait for a response from server before considering it unresponsive:
 RESPONSE_TIMEOUT = 5000 # ms
@@ -111,7 +111,7 @@ class NetworkingUtils(object):
             else:
                 return ipv4_servers, ipv6_servers
 
-
+    @staticmethod
     def host_or_ip_to_ip(host_or_ip, ipv4=False, verbose=False):
         """Get a hostname or an IP address and return the corresponding IP address."""
         ipv6_err = None
@@ -534,10 +534,10 @@ def main():
                         help='Only use IPv4 when choosing a server or looking up given hostname. ' +
                              'Otherwise, IPv6 is preferred.')
 
-    parser.add_argument('-m', '--monitor-port', type=int,
-                        help='A port number, to which a ZeroMQ PULL socket is bound (on localhost), which '
-                             'lansound should send events to. This is for monitoring lansound\'s status, '
-                             'and is used for example by indicator-lansound to display an icon and other information.')
+    # parser.add_argument('-m', '--monitor-port', type=int,
+    #                     help='A port number, to which a ZeroMQ PULL socket is bound (on localhost), which '
+    #                          'lansound should send events to. This is for monitoring lansound\'s status, '
+    #                          'and is used for example by indicator-lansound to display an icon and other information.')
 
     parser.add_argument('-v', '--verbose', dest='verbose', action='store_const', const=True, default=False,
                         help='Print debug information.')

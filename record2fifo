@@ -9,6 +9,7 @@ gi.require_version('Gst', '1.0')
 from gi.repository import Gst, GLib
 import argparse
 
+CHUNK_SIZE = 1024
 
 class RecordFIFO(object):
     def __init__(self, idle_timeout, sourcename, filename, verbose):
@@ -27,6 +28,7 @@ class RecordFIFO(object):
 
         self.audio_sink = Gst.ElementFactory.make('filesink')
         self.audio_sink.set_property('location', filename)
+        self.audio_sink.set_property('buffer-size', CHUNK_SIZE)
 
         # Add our elements to the pipeline.
         self.pipeline.add(self.audio_source)
