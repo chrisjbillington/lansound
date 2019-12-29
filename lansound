@@ -550,7 +550,7 @@ def main():
         sys.exit(0)
 
     app = LansoundClient(args.host, args.port, args.latency, args.idle_timeout,
-        args.auto_enable, args.ipv4, args.monitor_port, args.verbose)
+        args.auto_enable, args.ipv4, None, args.verbose)
     app.run()
 
 if __name__ == '__main__':
